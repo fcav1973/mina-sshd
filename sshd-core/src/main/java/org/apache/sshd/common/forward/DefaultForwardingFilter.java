@@ -34,8 +34,10 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.apache.sshd.client.channel.ClientChannelEvent;
+import org.apache.sshd.client.future.OpenFuture;
 import org.apache.sshd.common.Closeable;
 import org.apache.sshd.common.Factory;
 import org.apache.sshd.common.FactoryManager;
@@ -915,18 +917,17 @@ public class DefaultForwardingFilter
         return getClass().getSimpleName() + "[" + getSession() + "]";
     }
 
-    //
-    // Static IoHandler implementation
-    //
-
+    @SuppressWarnings("synthetic-access")
     class StaticIoHandler implements IoHandler {
+        private final AtomicLong messagesCounter = new AtomicLong(0L);
+        private final boolean traceEnabled = log.isTraceEnabled();
+
         StaticIoHandler() {
             super();
         }
 
         @Override
-        @SuppressWarnings("synthetic-access")
-        public void sessionCreated(final IoSession session) throws Exception {
+        public void sessionCreated(IoSession session) throws Exception {
             InetSocketAddress local = (InetSocketAddress) session.getLocalAddress();
             int localPort = local.getPort();
             SshdSocketAddress remote = localToRemote.get(localPort);
@@ -934,12 +935,8 @@ public class DefaultForwardingFilter
                 log.debug("sessionCreated({}) remote={}", session, remote);
             }
 
-            TcpipClientChannel channel;
-            if (remote != null) {
-                channel = new TcpipClientChannel(TcpipClientChannel.Type.Direct, session, remote);
-            } else {
-                channel = new TcpipClientChannel(TcpipClientChannel.Type.Forwarded, session, null);
-            }
+            TcpipClientChannel.Type channelType = (remote == null) ? TcpipClientChannel.Type.Forwarded : TcpipClientChannel.Type.Direct;
+            TcpipClientChannel channel = new TcpipClientChannel(channelType, session, remote);
             session.setAttribute(TcpipClientChannel.class, channel);
 
             service.registerChannel(channel);
@@ -958,45 +955,59 @@ public class DefaultForwardingFilter
         }
 
         @Override
-        @SuppressWarnings("synthetic-access")
         public void sessionClosed(IoSession session) throws Exception {
-            TcpipClientChannel channel = (TcpipClientChannel) session.getAttribute(TcpipClientChannel.class);
+            TcpipClientChannel channel = (TcpipClientChannel) session.removeAttribute(TcpipClientChannel.class);
+            Throwable cause = (Throwable) session.removeAttribute(TcpipForwardingExceptionMarker.class);
             if (channel != null) {
                 if (log.isDebugEnabled()) {
-                    log.debug("sessionClosed({}) closing channel={}", session, channel);
+                    log.debug("sessionClosed({}) closing channel={} after {} messages - cause={}",
+                            session, channel, messagesCounter, (cause == null) ? null : cause.getClass().getSimpleName());
                 }
-                channel.close(false);
+                // If exception signaled then close channel immediately
+                channel.close(cause != null);
             }
         }
 
         @Override
-        @SuppressWarnings("synthetic-access")
         public void messageReceived(IoSession session, Readable message) throws Exception {
             TcpipClientChannel channel = (TcpipClientChannel) session.getAttribute(TcpipClientChannel.class);
+            long totalMessages = messagesCounter.incrementAndGet();
             Buffer buffer = new ByteArrayBuffer(message.available() + Long.SIZE, false);
             buffer.putBuffer(message);
 
-            Collection<ClientChannelEvent> result = channel.waitFor(STATIC_IO_MSG_RECEIVED_EVENTS, Long.MAX_VALUE);
-            if (log.isTraceEnabled()) {
-                log.trace("messageReceived({}) channel={}, len={} wait result: {}",
-                          session, channel, result, buffer.array());
+            if (traceEnabled) {
+                log.trace("messageReceived({}) channel={}, count={}, handle len={}",
+                          session, channel, totalMessages, message.available());
             }
 
-            OutputStream outputStream = channel.getInvertedIn();
-            outputStream.write(buffer.array(), buffer.rpos(), buffer.available());
-            outputStream.flush();
+            OpenFuture future = channel.getOpenFuture();
+            if (future.isOpened()) {
+                OutputStream outputStream = channel.getInvertedIn();
+                outputStream.write(buffer.array(), buffer.rpos(), buffer.available());
+                outputStream.flush();
+            } else {
+                future.addListener(f -> {
+                    try {
+                        OutputStream outputStream = channel.getInvertedIn();
+                        outputStream.write(buffer.array(), buffer.rpos(), buffer.available());
+                        outputStream.flush();
+                    } catch (IOException e) {
+                        channel.getSession().exceptionCaught(e);
+                    }
+                });
+            }
         }
 
         @Override
-        @SuppressWarnings("synthetic-access")
         public void exceptionCaught(IoSession session, Throwable cause) throws Exception {
+            session.setAttribute(TcpipForwardingExceptionMarker.class, cause);
             if (log.isDebugEnabled()) {
                 log.debug("exceptionCaught({}) {}: {}", session, cause.getClass().getSimpleName(), cause.getMessage());
             }
-            if (log.isTraceEnabled()) {
+            if (traceEnabled) {
                 log.trace("exceptionCaught(" + session + ") caught exception details", cause);
             }
-            session.close(false);
+            session.close(true);
         }
     }
 }
